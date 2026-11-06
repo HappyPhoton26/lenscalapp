@@ -12,7 +12,8 @@
 //   A               mode: BOTH eyes / LEFT eye / RIGHT eye
 //   either stick    move lens centering in 0.25 px steps. BOTH: X = in/out (mirrored), Y = up/down together
 //   trigger (hold)  fine (slower)
-//   grip            red centre pixel on/off (one pixel at each eye's image centre, moves with the centering)
+//   B               stick mode: MOVE (lens centering) / ROTATE (per-eye roll about the lens centre, 0.01 deg steps)
+//   grip            centre pixel on/off (left eye BLUE, right eye RED; at each eye's lens centre)
 //   (the photo is always 10 m away)
 //   stick click     back to the start values (for the eye(s) of the current mode)
 // Values are saved to ~/.config/lensalign/offsets.txt and loaded on the next start.
@@ -54,6 +55,12 @@ static M4 m_proj(XrFovf f, float n, float fa, float tx, float ty) {
     m.m[10] = -(fa + n) / (fa - n); m.m[11] = -1; m.m[14] = -2 * fa * n / (fa - n);
     // image-space shift in NDC (lens centering): x' = x + tx*w  ->  add tx * (-z) column
     m.m[8] -= tx; m.m[9] -= ty;
+    return m;
+}
+// roll about the view axis (CCW in the image, x right / y up)
+static M4 m_roll(float deg) {
+    float c = cosf(deg * 0.0174533f), s = sinf(deg * 0.0174533f); M4 m = {{0}};
+    m.m[0] = c; m.m[1] = s; m.m[4] = -s; m.m[5] = c; m.m[10] = 1; m.m[15] = 1;
     return m;
 }
 // inverse of rigid pose (q, p)
@@ -100,6 +107,55 @@ static void circle(List *L, float rdeg, float wdeg, float r, float g, float b) {
     }
 }
 
+/* ---------- 3D scene geometry (x,y,z, rgb) in LOCAL space, metres, floor at y = FLOOR ---------- */
+#define FLOOR (-1.6f)
+typedef struct { float *v; int n, cap; } List3;
+static void push3(List3 *L, float x, float y, float z, float r, float g, float b) {
+    if (L->n + 1 > L->cap) { L->cap = L->cap ? L->cap * 2 : 4096; L->v = realloc(L->v, L->cap * 6 * sizeof(float)); }
+    float *p = L->v + L->n * 6; p[0] = x; p[1] = y; p[2] = z; p[3] = r; p[4] = g; p[5] = b; L->n++;
+}
+static void quad3(List3 *L, const float *a, const float *b, const float *c, const float *d, float r, float g, float bl) {
+    push3(L, a[0], a[1], a[2], r, g, bl); push3(L, b[0], b[1], b[2], r, g, bl); push3(L, c[0], c[1], c[2], r, g, bl);
+    push3(L, a[0], a[1], a[2], r, g, bl); push3(L, c[0], c[1], c[2], r, g, bl); push3(L, d[0], d[1], d[2], r, g, bl);
+}
+// axis-aligned box, faces shaded by a fixed light so edges stay visible
+static void box3(List3 *L, float x0, float y0, float z0, float x1, float y1, float z1, float r, float g, float b) {
+    float v[8][3] = {{x0,y0,z0},{x1,y0,z0},{x1,y1,z0},{x0,y1,z0},{x0,y0,z1},{x1,y0,z1},{x1,y1,z1},{x0,y1,z1}};
+    struct { int i[4]; float k; } f[6] = {{{4,5,6,7},0.85f},{{1,0,3,2},0.55f},{{5,1,2,6},0.7f},{{0,4,7,3},0.65f},{{7,6,2,3},1.0f},{{0,1,5,4},0.3f}};
+    for (int i = 0; i < 6; i++) quad3(L, v[f[i].i[0]], v[f[i].i[1]], v[f[i].i[2]], v[f[i].i[3]], r*f[i].k, g*f[i].k, b*f[i].k);
+}
+static void build_scene(List3 *L) {
+    float y = FLOOR;
+    { float a[3] = {-60,y,-80}, b[3] = {60,y,-80}, c[3] = {60,y,40}, d[3] = {-60,y,40}; quad3(L, d, c, b, a, 0.08f, 0.09f, 0.1f); }
+    // floor grid, 1 m
+    for (int i = -40; i <= 40; i++) {
+        float w = (i % 5 == 0) ? 0.03f : 0.012f, k = (i % 5 == 0) ? 0.6f : 0.35f;
+        float a[3] = {i - w, y + 0.002f, -80}, b[3] = {i + w, y + 0.002f, -80}, c[3] = {i + w, y + 0.002f, 40}, d[3] = {i - w, y + 0.002f, 40};
+        quad3(L, d, c, b, a, k, k, k);
+        float e[3] = {-60, y + 0.003f, -i - w}, f[3] = {60, y + 0.003f, -i - w}, g[3] = {60, y + 0.003f, -i + w}, h[3] = {-60, y + 0.003f, -i + w};
+        quad3(L, h, g, f, e, k, k, k);
+    }
+    // pillars at increasing distance, alternating sides (good for near/far fusion)
+    static const float dist[] = {1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f, 18.0f, 26.0f, 40.0f};
+    static const float col[][3] = {{0.9f,0.3f,0.3f},{0.3f,0.8f,0.3f},{0.3f,0.5f,1.0f},{1.0f,0.8f,0.2f},{0.8f,0.3f,0.9f},{0.2f,0.9f,0.9f}};
+    for (int i = 0; i < 11; i++) {
+        float d = dist[i], x = (i & 1 ? 1 : -1) * (0.35f + d * 0.25f), s = 0.08f + d * 0.02f; const float *c = col[i % 6];
+        box3(L, x - s, y, -d - s, x + s, y + 1.6f + d * 0.15f, -d + s, c[0], c[1], c[2]);
+        box3(L, x - s * 1.6f, y + 1.6f + d * 0.15f, -d - s * 1.6f, x + s * 1.6f, y + 1.6f + d * 0.15f + s, -d + s * 1.6f, 0.9f, 0.9f, 0.9f);
+    }
+    // small cubes on a table straight ahead, eye height-ish
+    box3(L, -0.4f, y, -1.4f, 0.4f, y + 0.75f, -0.9f, 0.45f, 0.32f, 0.2f);
+    for (int i = 0; i < 4; i++) box3(L, -0.3f + i * 0.18f, y + 0.75f, -1.2f, -0.22f + i * 0.18f, y + 0.83f + i * 0.03f, -1.12f, col[i][0], col[i][1], col[i][2]);
+    // far wall with a grid of tiles, 50 m ahead
+    for (int i = -10; i < 10; i++) for (int j = 0; j < 8; j++) {
+        float k = ((i + j) & 1) ? 0.55f : 0.25f;
+        box3(L, i * 3.0f + 0.1f, y + j * 3.0f + 0.1f, -50.5f, i * 3.0f + 2.9f, y + j * 3.0f + 2.9f, -50, k, k, k * 1.1f);
+    }
+    // horizontal + vertical bars at 5 m (sharp edges for checking rotation)
+    box3(L, -3, -0.02f, -5.05f, 3, 0.02f, -5, 1, 1, 1);
+    box3(L, -0.02f, -1.5f, -5.05f, 0.02f, 1.5f, -5, 1, 1, 1);
+}
+
 /* ---------- 5x7 font ---------- */
 static const unsigned char *glyph(char c) {
     static const unsigned char digits[10][7] = {
@@ -139,26 +195,28 @@ static void text(List *L, const char *s, float ydeg, float cdeg, float r, float 
 }
 
 /* ---------- settings ---------- */
-typedef struct { float lens[2], pos[2]; } EyeOff;   // lens px (x right, y up), pos mm (x right, y up)
+typedef struct { float lens[2], pos[2], roll; } EyeOff;   // lens px (x right, y up), pos mm (x right, y up), roll deg (CCW +)
 static EyeOff off[2];
 static char cfgpath[1024];
 static void save_cfg(void) {
     char dir[1024]; snprintf(dir, sizeof dir, "%s/.config/lensalign", getenv("HOME")); mkdir(dir, 0755);
     FILE *f = fopen(cfgpath, "w"); if (!f) return;
-    fprintf(f, "# eye lens_px_x lens_px_y pos_mm_x pos_mm_y   (lensalign; in-app only)\n");
-    for (int e = 0; e < 2; e++) fprintf(f, "%s %.2f %.2f %.3f %.3f\n", e ? "right" : "left", off[e].lens[0], off[e].lens[1], off[e].pos[0], off[e].pos[1]);
+    fprintf(f, "# eye lens_px_x lens_px_y pos_mm_x pos_mm_y roll_deg   (lensalign; in-app only)\n");
+    for (int e = 0; e < 2; e++) fprintf(f, "%s %.2f %.2f %.3f %.3f %.3f\n", e ? "right" : "left", off[e].lens[0], off[e].lens[1], off[e].pos[0], off[e].pos[1], off[e].roll);
     fclose(f);
-    printf("saved: L lens %+.2f %+.2f px pos %+.2f %+.2f mm | R lens %+.2f %+.2f px pos %+.2f %+.2f mm\n",
-           off[0].lens[0], off[0].lens[1], off[0].pos[0], off[0].pos[1], off[1].lens[0], off[1].lens[1], off[1].pos[0], off[1].pos[1]);
+    printf("saved: L lens %+.2f %+.2f px roll %+.3f deg | R lens %+.2f %+.2f px roll %+.3f deg\n",
+           off[0].lens[0], off[0].lens[1], off[0].roll, off[1].lens[0], off[1].lens[1], off[1].roll);
     fflush(stdout);
 }
 static void load_cfg(void) {
     FILE *f = fopen(cfgpath, "r"); if (!f) return;
     char line[256], name[16]; EyeOff o;
-    while (fgets(line, sizeof line, f))
-        if (sscanf(line, "%15s %f %f %f %f", name, &o.lens[0], &o.lens[1], &o.pos[0], &o.pos[1]) == 5) {
+    while (fgets(line, sizeof line, f)) {
+        o.roll = 0;   // older files have no roll column
+        if (sscanf(line, "%15s %f %f %f %f %f", name, &o.lens[0], &o.lens[1], &o.pos[0], &o.pos[1], &o.roll) >= 5) {
             if (!strcmp(name, "left")) off[0] = o; else if (!strcmp(name, "right")) off[1] = o;
         }
+    }
     fclose(f);
 }
 
@@ -169,6 +227,11 @@ static const char *VS =
     "void main(){ vc=c; gl_Position = mvp*vec4(p*D, -D, 1.0); }\n";
 static const char *FS =
     "#version 430 core\n in vec3 vc; out vec4 o; void main(){ o = vec4(vc,1.0); }\n";
+static const char *SVS =
+    "#version 430 core\n"
+    "layout(location=0) in vec3 p; layout(location=1) in vec3 c;\n"
+    "uniform mat4 mvp; out vec3 vc;\n"
+    "void main(){ vc=c; gl_Position = mvp*vec4(p, 1.0); }\n";
 static const char *TVS =
     "#version 430 core\n"
     "layout(location=0) in vec2 p; layout(location=1) in vec2 uv;\n"
@@ -250,6 +313,7 @@ int main(int argc, char **argv) {
     XrReferenceSpaceCreateInfo rsi = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
     rsi.poseInReferenceSpace.orientation.w = 1;
     rsi.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW; XrSpace vspace; CHK(xrCreateReferenceSpace(sess, &rsi, &vspace));
+    rsi.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL; XrSpace lspace; CHK(xrCreateReferenceSpace(sess, &rsi, &lspace));
 
     // swapchains
     XrViewConfigurationView vcv[2] = {{XR_TYPE_VIEW_CONFIGURATION_VIEW}, {XR_TYPE_VIEW_CONFIGURATION_VIEW}};
@@ -257,7 +321,7 @@ int main(int argc, char **argv) {
     int64_t fmts[64]; uint32_t nf; CHK(xrEnumerateSwapchainFormats(sess, 64, &nf, fmts));
     int64_t fmt = fmts[0];
     for (uint32_t i = 0; i < nf; i++) if (fmts[i] == GL_SRGB8_ALPHA8) { fmt = GL_SRGB8_ALPHA8; break; }
-    XrSwapchain sc[2]; XrSwapchainImageOpenGLKHR img[2][8]; uint32_t nimg[2]; GLuint fbo[2], msfbo[2], msrb[2]; int W[2], H[2];
+    XrSwapchain sc[2]; XrSwapchainImageOpenGLKHR img[2][8]; uint32_t nimg[2]; GLuint fbo[2], msfbo[2], msrb[2], msdb[2]; int W[2], H[2];
     for (int e = 0; e < 2; e++) {
         W[e] = vcv[e].recommendedImageRectWidth; H[e] = vcv[e].recommendedImageRectHeight;
         XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
@@ -273,6 +337,9 @@ int main(int argc, char **argv) {
         glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, (GLenum)fmt, W[e], H[e]);
         glBindFramebuffer(GL_FRAMEBUFFER, msfbo[e]);
         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, msrb[e]);
+        glGenRenderbuffers(1, &msdb[e]); glBindRenderbuffer(GL_RENDERBUFFER, msdb[e]);
+        glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_DEPTH_COMPONENT24, W[e], H[e]);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, msdb[e]);
         printf("eye %d: %dx%d\n", e, W[e], H[e]);
     }
 
@@ -309,6 +376,21 @@ int main(int argc, char **argv) {
     glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, (void *)0);
     glEnableVertexAttribArray(1); glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, (void *)8);
     float text_top = atanf(qc - qy) / DEG - 1.5f;
+    GLuint sprog = glCreateProgram();
+    glAttachShader(sprog, mk_shader(GL_VERTEX_SHADER, SVS)); glAttachShader(sprog, mk_shader(GL_FRAGMENT_SHADER, FS));
+    glLinkProgram(sprog);
+    GLint us_mvp = glGetUniformLocation(sprog, "mvp");
+    List3 scene = {0}; build_scene(&scene);
+    GLuint svao, svbo; glGenVertexArrays(1, &svao); glGenBuffers(1, &svbo); glBindVertexArray(svao); glBindBuffer(GL_ARRAY_BUFFER, svbo);
+    glBufferData(GL_ARRAY_BUFFER, (size_t)scene.n * 24, scene.v, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0); glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 24, (void *)0);
+    glEnableVertexAttribArray(1); glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 24, (void *)12);
+    printf("3d scene: %d vertices\n", scene.n);
+    // crosshair: 2 lines in pixel space per eye
+    GLuint cvao, cvbo; glGenVertexArrays(1, &cvao); glGenBuffers(1, &cvbo); glBindVertexArray(cvao); glBindBuffer(GL_ARRAY_BUFFER, cvbo);
+    glBufferData(GL_ARRAY_BUFFER, 4 * 20, NULL, GL_STREAM_DRAW);
+    glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 20, (void *)0);
+    glEnableVertexAttribArray(1); glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 20, (void *)8);
     GLuint vao, vbo; glGenVertexArrays(1, &vao); glGenBuffers(1, &vbo); glBindVertexArray(vao); glBindBuffer(GL_ARRAY_BUFFER, vbo);
     glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 20, (void *)0);
     glEnableVertexAttribArray(1); glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 20, (void *)8);
@@ -345,7 +427,7 @@ int main(int argc, char **argv) {
                 sb[n].action = b[i].a;
                 if (XR_FAILED(xrStringToPath(inst, path, &sb[n].binding))) continue;
                 s.suggestedBindings = sb; s.countSuggestedBindings = n + 1;
-                if (XR_SUCCEEDED(xrSuggestInteractionProfileBindings(inst, &s))) n++;
+                if (XR_SUCCEEDED(xrSuggestInteractionProfileBindings(inst, &s))) { n++; printf("  bound %s\n", path); }
             }
         }
         s.countSuggestedBindings = n;
@@ -355,11 +437,13 @@ int main(int argc, char **argv) {
     XrSessionActionSetsAttachInfo att = {XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO}; att.countActionSets = 1; att.actionSets = &aset;
     CHK(xrAttachSessionActionSets(sess, &att));
 
-    int running = 0, prev_dist[2] = {0}, prev_click[2] = {0}, dirty = 0;
+    int running = 0, prev_dist[2] = {0}, prev_click[2] = {0}, dirty = 0, rot = 0;   // rot: stick adjusts roll instead of centering
     double last_t = now_s(), last_change = 0;
     int stick_active[2] = {-1, -1};
-    int mode = 0, red_px = 0, prev_eye[2] = {0}, prev_grip[2] = {0}, prev_stick[2] = {0};   // mode 0 both, 1 left, 2 right
-    float acc[2] = {0, 0}, base[2][2];                     // base = values at start (stick click returns to them)
+    int a_long[2] = {0}; double a_down_t[2] = {0};
+    int view = 0, mode = 0, red_px = 0, prev_eye[2] = {0}, prev_grip[2] = {0}, prev_stick[2] = {0};   // mode 0 both, 1 left, 2 right
+    float acc[2] = {0, 0}, base[2][2], base_roll[2];      // base = values at start (stick click returns to them)
+    for (int e = 0; e < 2; e++) base_roll[e] = off[e].roll = roundf(off[e].roll * 100) / 100;
     for (int e = 0; e < 2; e++) for (int k = 0; k < 2; k++) base[e][k] = off[e].lens[k] = roundf(off[e].lens[k] * 4) / 4;
     List shared = {0}, only[2] = {{0}, {0}};
 
@@ -401,11 +485,20 @@ int main(int argc, char **argv) {
             XrActionStateGetInfo gi = {XR_TYPE_ACTION_STATE_GET_INFO}; gi.subactionPath = hand[h];
             XrActionStateBoolean bs = {XR_TYPE_ACTION_STATE_BOOLEAN};
             gi.action = a_eye; xrGetActionStateBoolean(sess, &gi, &bs);
-            int v = bs.isActive && bs.currentState; if (v && !prev_eye[h]) { mode = (mode + 1) % 3; acc[0] = acc[1] = 0; } prev_eye[h] = v;
+            int v = bs.isActive && bs.currentState;
+            // A/X on either hand: tap = eye mode, hold 0.5 s = next view
+            if (v && !prev_eye[h]) { a_down_t[h] = t; a_long[h] = 0; printf("%s A/X down\n", h ? "right" : "left"); fflush(stdout); }
+            if (v && !a_long[h] && t - a_down_t[h] >= 0.5) { a_long[h] = 1; view = (view + 1) % 3; acc[0] = acc[1] = 0; printf("view -> %d\n", view); fflush(stdout); }
+            if (!v && prev_eye[h] && !a_long[h]) { mode = (mode + 1) % 3; acc[0] = acc[1] = 0; printf("mode -> %d\n", mode); fflush(stdout); }
+            prev_eye[h] = v;
+            gi.action = a_dist; xrGetActionStateBoolean(sess, &gi, &bs);
+            v = bs.isActive && bs.currentState; if (v && !prev_dist[h]) { rot ^= 1; acc[0] = acc[1] = 0; printf("%s B/Y -> %s\n", h ? "right" : "left", rot ? "ROTATE" : "MOVE"); fflush(stdout); } prev_dist[h] = v;
             gi.action = a_click; xrGetActionStateBoolean(sess, &gi, &bs);
             v = bs.isActive && bs.currentState;
             if (v && !prev_click[h]) {
-                for (int e = 0; e < 2; e++) if (mode == 0 || mode == e + 1) { off[e].lens[0] = base[e][0]; off[e].lens[1] = base[e][1]; }
+                for (int e = 0; e < 2; e++) if (mode == 0 || mode == e + 1) {
+                    if (rot) off[e].roll = base_roll[e]; else { off[e].lens[0] = base[e][0]; off[e].lens[1] = base[e][1]; }
+                }
                 dirty = 1; last_change = t;
             }
             prev_click[h] = v;
@@ -421,7 +514,25 @@ int main(int argc, char **argv) {
             if (fabsf(vs.currentState.y) > fabsf(stick[1])) stick[1] = vs.currentState.y;
         }
         // stick -> 0.25 px steps. BOTH: X = out(+)/in(-) mirrored, Y = both up/down together. LEFT/RIGHT: that eye only.
-        for (int k = 0; k < 2; k++) {
+        // ROTATE: stick X clocks the image about the lens center in 0.01 deg steps.
+        //   BOTH = relative (left +, right -), LEFT/RIGHT = that eye only. + = counter-clockwise.
+        if (rot) {
+            const float RS = 0.01f;
+            if (fabsf(stick[0]) < 0.15f) acc[0] = 0;
+            else {
+                float m = (fabsf(stick[0]) - 0.15f) / 0.85f; m = m * m * (stick[0] < 0 ? -1 : 1);
+                acc[0] += m * (rate < 1 ? 0.1f : 1.0f) * dt;       // deg per second at full deflection
+                if (prev_stick[0] == 0) acc[0] += stick[0] < 0 ? -RS : RS;
+                while (fabsf(acc[0]) >= RS) {
+                    float d = acc[0] > 0 ? RS : -RS; acc[0] -= d;
+                    if (mode == 0) { off[0].roll += d / 2; off[1].roll -= d / 2; }
+                    else off[mode - 1].roll += d;
+                    dirty = 1; last_change = t;
+                }
+            }
+            prev_stick[0] = fabsf(stick[0]) >= 0.15f; prev_stick[1] = 0;
+        }
+        else for (int k = 0; k < 2; k++) {
             if (fabsf(stick[k]) < 0.15f) { acc[k] = 0; continue; }
             float m = (fabsf(stick[k]) - 0.15f) / 0.85f; m = m * m * (stick[k] < 0 ? -1 : 1);
             acc[k] += m * (rate < 1 ? 1.0f : 10.0f) * dt;          // px per second
@@ -433,13 +544,16 @@ int main(int argc, char **argv) {
                 dirty = 1; last_change = t;
             }
         }
-        for (int k = 0; k < 2; k++) prev_stick[k] = fabsf(stick[k]) >= 0.15f;
+        if (!rot) for (int k = 0; k < 2; k++) prev_stick[k] = fabsf(stick[k]) >= 0.15f;
         if (dirty && t - last_change > 1.0) { save_cfg(); dirty = 0; }
 
         XrViewLocateInfo vli = {XR_TYPE_VIEW_LOCATE_INFO};
         vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO; vli.displayTime = fs.predictedDisplayTime; vli.space = vspace;
         XrViewState vst = {XR_TYPE_VIEW_STATE}; XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}; uint32_t nvo;
         CHK(xrLocateViews(sess, &vli, &vst, 2, &nvo, views));
+        XrViewState vstl = {XR_TYPE_VIEW_STATE}; XrView lviews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+        vli.space = lspace; CHK(xrLocateViews(sess, &vli, &vstl, 2, &nvo, lviews));
+        int world = view == 1 && (vstl.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) && (vstl.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
         int render = fs.shouldRender && (vst.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
 
         XrCompositionLayerProjectionView pv[2];
@@ -447,8 +561,11 @@ int main(int argc, char **argv) {
             shared.n = only[0].n = only[1].n = 0;
             // text
             char line[128]; float y = text_top, cs = 0.16f;
-            const char *mn[3] = {"BOTH EYES  (X = IN/OUT, Y = UP/DOWN)", "LEFT EYE ONLY", "RIGHT EYE ONLY"};
-            snprintf(line, sizeof line, "MODE: %s", mn[mode]);
+            const char *mn[3] = {"BOTH EYES", "LEFT EYE ONLY", "RIGHT EYE ONLY"};
+            const char *vn[3] = {"PHOTO", "3D SCENE", "CROSSHAIR"};
+            snprintf(line, sizeof line, "VIEW: %s", vn[view]);
+            text(&shared, line, y + 11 * cs * 1.3f, cs * 1.3f, 0.5f, 0.9f, 1.0f);
+            snprintf(line, sizeof line, "MODE: %s   STICK: %s", mn[mode], rot ? (mode ? "ROTATE (X)" : "ROTATE RELATIVE (X)") : (mode ? "MOVE" : "MOVE (X = IN/OUT, Y = UP/DOWN)"));
             text(&shared, line, y, cs * 1.3f, 1, 1, 0.4f); y -= 11 * cs * 1.3f;
             for (int e = 0; e < 2; e++) {
                 float pdx = (tanf(views[e].fov.angleRight) - tanf(views[e].fov.angleLeft)) / W[e];
@@ -457,12 +574,14 @@ int main(int argc, char **argv) {
                 int act = mode == 0 || mode == e + 1;
                 text(&shared, line, y, cs, act ? 1 : 0.5f, act ? 1 : 0.5f, act ? 1 : 0.5f); y -= 9 * cs;
             }
-            snprintf(line, sizeof line, "RED CENTER PIXEL: %s", red_px ? "ON" : "OFF");
+            snprintf(line, sizeof line, "ROLL  LEFT %+.2f DEG   RIGHT %+.2f DEG   (DIFF %+.2f)", off[0].roll, off[1].roll, off[0].roll - off[1].roll);
+            text(&shared, line, y, cs, rot ? 1 : 0.7f, rot ? 1 : 0.7f, rot ? 0.4f : 0.7f); y -= 9 * cs;
+            snprintf(line, sizeof line, "CENTER PIXELS (L BLUE / R RED): %s", red_px ? "ON" : "OFF");
             text(&shared, line, y, cs, 1, red_px ? 0.3f : 0.8f, red_px ? 0.3f : 0.8f); y -= 9 * cs;
             if (rate < 1) { text(&shared, "FINE", y, cs, 0.8f, 0.8f, 0.8f); }
             y -= 12 * cs;
-            text(&shared, "A = BOTH / LEFT / RIGHT   STICK = MOVE (0.25 PX STEPS)   TRIGGER = FINE", y, cs * 0.8f, 0.6f, 0.6f, 0.6f); y -= 9 * cs * 0.8f;
-            text(&shared, "GRIP = RED CENTER PIXEL   STICK CLICK = BACK TO START", y, cs * 0.8f, 0.6f, 0.6f, 0.6f);
+            text(&shared, "A TAP = BOTH / LEFT / RIGHT   A HOLD = PHOTO / 3D / CROSSHAIR   TRIGGER = FINE", y, cs * 0.8f, 0.6f, 0.6f, 0.6f); y -= 9 * cs * 0.8f;
+            text(&shared, "B = MOVE / ROTATE   GRIP = CENTER PIXELS   STICK CLICK = BACK TO START", y, cs * 0.8f, 0.6f, 0.6f, 0.6f);
 
             int nsh = shared.n;
             glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -481,30 +600,54 @@ int main(int argc, char **argv) {
                 glBindFramebuffer(GL_FRAMEBUFFER, msfbo[e]);
                 glViewport(0, 0, W[e], H[e]);
                 glEnable(GL_FRAMEBUFFER_SRGB); glEnable(GL_MULTISAMPLE); glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
-                glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
+                glClearColor(0, 0, 0, 1); glClearDepth(1); glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
                 // eye pose shifted by the position offset (head frame), projection shifted by lens centering
                 XrPosef ep2 = views[e].pose;
                 // (eye position offsets are not used)
                 float tx = 2.0f * off[e].lens[0] / W[e], ty = 2.0f * off[e].lens[1] / H[e];
-                M4 mvp = mmul(m_proj(views[e].fov, 0.05f, 3000.0f, tx, ty), m_view(ep2.orientation, ep2.position));
+                M4 mvp = mmul(m_proj(views[e].fov, 0.05f, 3000.0f, tx, ty), mmul(m_roll(off[e].roll), m_view(ep2.orientation, ep2.position)));
+                if (world) {   // world-locked 3D scene, same lens shift + roll
+                    M4 smvp = mmul(m_proj(lviews[e].fov, 0.05f, 3000.0f, tx, ty), mmul(m_roll(off[e].roll), m_view(lviews[e].pose.orientation, lviews[e].pose.position)));
+                    glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LESS);
+                    glUseProgram(sprog); glUniformMatrix4fv(us_mvp, 1, GL_FALSE, smvp.m);
+                    glBindVertexArray(svao); glDrawArrays(GL_TRIANGLES, 0, scene.n);
+                    glDisable(GL_DEPTH_TEST);
+                } else if (view == 0) {
+                    glUseProgram(tprog); glUniformMatrix4fv(ut_mvp, 1, GL_FALSE, mvp.m); glUniform1f(ut_D, D);
+                    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex); glBindVertexArray(pvao);
+                    glDrawArrays(GL_TRIANGLES, 0, 6);
+                }
                 glUseProgram(prog); glUniformMatrix4fv(u_mvp, 1, GL_FALSE, mvp.m); glUniform1f(u_D, D);
                 glBindVertexArray(vao);
-                glDrawArrays(GL_TRIANGLES, 0, nsh);
-                glUseProgram(tprog); glUniformMatrix4fv(ut_mvp, 1, GL_FALSE, mvp.m); glUniform1f(ut_D, D);
-                glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex); glBindVertexArray(pvao);
-                glDrawArrays(GL_TRIANGLES, 0, 6);
+                glDrawArrays(GL_TRIANGLES, 0, nsh);   // HUD text, head-locked, on top
 
                 glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo[e]);
                 glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, img[e][ii].image, 0);
                 glBindFramebuffer(GL_READ_FRAMEBUFFER, msfbo[e]);
                 glBlitFramebuffer(0, 0, W[e], H[e], 0, 0, W[e], H[e], GL_COLOR_BUFFER_BIT, GL_NEAREST);
-                if (red_px) {   // one red pixel at the (shifted) centre of this eye's image
+                if (view == 2) {   // 1-pixel crosshair through the lens centre, rotated by the roll; left blue, right red
+                    float l = tanf(views[e].fov.angleLeft), r = tanf(views[e].fov.angleRight);
+                    float u = tanf(views[e].fov.angleUp), d = tanf(views[e].fov.angleDown);
+                    float cx = floorf((-l / (r - l)) * W[e] + off[e].lens[0]) + 0.5f, cy = floorf((-d / (u - d)) * H[e] + off[e].lens[1]) + 0.5f;
+                    float c = cosf(off[e].roll * DEG), sn = sinf(off[e].roll * DEG), L = (float)(W[e] + H[e]);
+                    float cr = e ? 1 : 0, cb = e ? 0 : 1;
+                    float cv[20] = {cx - c*L, cy - sn*L, cr, 0, cb,  cx + c*L, cy + sn*L, cr, 0, cb,
+                                    cx + sn*L, cy - c*L, cr, 0, cb,  cx - sn*L, cy + c*L, cr, 0, cb};
+                    M4 ortho = {{0}}; ortho.m[0] = 2.0f / W[e]; ortho.m[5] = 2.0f / H[e]; ortho.m[12] = -1; ortho.m[13] = -1; ortho.m[15] = 1;
+                    glBindFramebuffer(GL_FRAMEBUFFER, fbo[e]); glViewport(0, 0, W[e], H[e]); glDisable(GL_MULTISAMPLE);
+                    glBindBuffer(GL_ARRAY_BUFFER, cvbo); glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof cv, cv);
+                    glUseProgram(prog); glUniformMatrix4fv(u_mvp, 1, GL_FALSE, ortho.m); glUniform1f(u_D, 1);
+                    glBindVertexArray(cvao); glLineWidth(1); glDrawArrays(GL_LINES, 0, 4);
+                    glEnable(GL_MULTISAMPLE);
+                }
+                if (red_px) {   // one pixel at the (shifted) centre of this eye's image: left blue, right red
                     float l = tanf(views[e].fov.angleLeft), r = tanf(views[e].fov.angleRight);
                     float u = tanf(views[e].fov.angleUp), d = tanf(views[e].fov.angleDown);
                     float cx = (-l / (r - l)) * W[e] + off[e].lens[0], cy = (-d / (u - d)) * H[e] + off[e].lens[1];
                     glBindFramebuffer(GL_FRAMEBUFFER, fbo[e]);
                     glEnable(GL_SCISSOR_TEST); glScissor((int)floorf(cx), (int)floorf(cy), 1, 1);
-                    glClearColor(1, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT); glDisable(GL_SCISSOR_TEST);
+                    if (e == 0) glClearColor(0, 0, 1, 1); else glClearColor(1, 0, 0, 1);   // left = blue, right = red
+                    glClear(GL_COLOR_BUFFER_BIT); glDisable(GL_SCISSOR_TEST);
                 }
                 glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
@@ -512,13 +655,13 @@ int main(int argc, char **argv) {
                 CHK(xrReleaseSwapchainImage(sc[e], &ri));
                 // the layer declares the TRUE eye pose/fov, so the offsets above really move the image
                 pv[e] = (XrCompositionLayerProjectionView){XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-                pv[e].pose = views[e].pose; pv[e].fov = views[e].fov;
+                pv[e].pose = world ? lviews[e].pose : views[e].pose; pv[e].fov = world ? lviews[e].fov : views[e].fov;
                 pv[e].subImage.swapchain = sc[e]; pv[e].subImage.imageRect.extent.width = W[e]; pv[e].subImage.imageRect.extent.height = H[e];
             }
             glFlush();
         }
         XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-        layer.space = vspace; layer.viewCount = 2; layer.views = pv;
+        int world_layer = render && world; layer.space = world_layer ? lspace : vspace; layer.viewCount = 2; layer.views = pv;
         const XrCompositionLayerBaseHeader *layers[] = {(XrCompositionLayerBaseHeader *)&layer};
         XrFrameEndInfo fei = {XR_TYPE_FRAME_END_INFO};
         fei.displayTime = fs.predictedDisplayTime; fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
