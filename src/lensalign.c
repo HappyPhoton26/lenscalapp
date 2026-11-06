@@ -300,8 +300,8 @@ int main(int argc, char **argv) {
     glAttachShader(tprog, mk_shader(GL_VERTEX_SHADER, TVS)); glAttachShader(tprog, mk_shader(GL_FRAGMENT_SHADER, TFS));
     glLinkProgram(tprog);
     GLint ut_mvp = glGetUniformLocation(tprog, "mvp"), ut_D = glGetUniformLocation(tprog, "D");
-    // photo quad: 30 deg wide, centred 3 deg up
-    float qx = tanf(15 * DEG), qy = qx * ph / pw, qc = tanf(3 * DEG);
+    // photo quad: 45 deg wide, centred 3 deg up
+    float qx = tanf(22.5f * DEG), qy = qx * ph / pw, qc = tanf(3 * DEG);
     float pq[] = {-qx, qc - qy, 0, 1,  qx, qc - qy, 1, 1,  qx, qc + qy, 1, 0,
                   -qx, qc - qy, 0, 1,  qx, qc + qy, 1, 0, -qx, qc + qy, 0, 0};
     GLuint pvao, pvbo; glGenVertexArrays(1, &pvao); glGenBuffers(1, &pvbo); glBindVertexArray(pvao); glBindBuffer(GL_ARRAY_BUFFER, pvbo);
