@@ -13,7 +13,7 @@
 //   either stick    move lens centering in 0.25 px steps. BOTH: X = in/out (mirrored), Y = up/down together
 //   trigger (hold)  fine (slower)
 //   grip            red centre pixel on/off (one pixel at each eye's image centre, moves with the centering)
-//   (the photo is always at infinity)
+//   (the photo is always 10 m away)
 //   stick click     back to the start values (for the eye(s) of the current mode)
 // Values are saved to ~/.config/lensalign/offsets.txt and loaded on the next start.
 #define GL_GLEXT_PROTOTYPES
@@ -471,7 +471,7 @@ int main(int argc, char **argv) {
             glBufferSubData(GL_ARRAY_BUFFER, (size_t)nsh * 20, (size_t)only[0].n * 20, only[0].v);
             glBufferSubData(GL_ARRAY_BUFFER, (size_t)(nsh + only[0].n) * 20, (size_t)only[1].n * 20, only[1].v);
 
-            float D = 1000.0f;   // always at infinity
+            float D = 10.0f;     // photo is 10 m away (user asked)
             for (int e = 0; e < 2; e++) {
                 uint32_t ii; XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
                 CHK(xrAcquireSwapchainImage(sc[e], &ai, &ii));
@@ -484,7 +484,7 @@ int main(int argc, char **argv) {
                 glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
                 // eye pose shifted by the position offset (head frame), projection shifted by lens centering
                 XrPosef ep2 = views[e].pose;
-                // (eye position offsets are not used: the photo is at infinity)
+                // (eye position offsets are not used)
                 float tx = 2.0f * off[e].lens[0] / W[e], ty = 2.0f * off[e].lens[1] / H[e];
                 M4 mvp = mmul(m_proj(views[e].fov, 0.05f, 3000.0f, tx, ty), m_view(ep2.orientation, ep2.position));
                 glUseProgram(prog); glUniformMatrix4fv(u_mvp, 1, GL_FALSE, mvp.m); glUniform1f(u_D, D);

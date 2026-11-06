@@ -3,7 +3,7 @@
 An OpenXR app for the Steam Frame (SteamVR on Linux, arm64). You use it to adjust **lens centering**
 so the left and right images fuse.
 
-It shows one photo to both eyes, always at infinity. You move each eye's image in 0.25-pixel steps
+It shows one photo to both eyes, always 10 m away. You move each eye's image in 0.25-pixel steps
 until the photo looks single and sharp. **The offsets only change this app's own rendering. Nothing in
 SteamVR or the headset settings is changed.**
 
@@ -35,7 +35,7 @@ left  <lens_px_x> <lens_px_y> <pos_mm_x> <pos_mm_y>
 right <lens_px_x> <lens_px_y> <pos_mm_x> <pos_mm_y>
 ```
 
-(`pos` is not used; the photo is at infinity.)
+(`pos` is not used.)
 
 ## How it works
 
